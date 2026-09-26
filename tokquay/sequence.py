@@ -12,6 +12,25 @@ class SequenceStatus(enum.Enum):
     FINISHED = "finished"
 
 
+@dataclass(frozen=True)
+class SamplingParams:
+    """Per-request generation settings. ``temperature == 0`` means greedy."""
+
+    max_tokens: int = 16
+    temperature: float = 0.0
+    top_k: int = 0  # 0 disables top-k filtering
+    ignore_eos: bool = False  # keep generating past EOS (benchmarks want fixed lengths)
+    seed: int | None = None  # per-request sampling seed; None = nondeterministic
+
+    def __post_init__(self) -> None:
+        if self.max_tokens < 1:
+            raise ValueError("max_tokens must be >= 1")
+        if self.temperature < 0:
+            raise ValueError("temperature must be >= 0")
+        if self.top_k < 0:
+            raise ValueError("top_k must be >= 0")
+
+
 @dataclass
 class Sequence:
     """One generation request.
@@ -33,6 +52,8 @@ class Sequence:
     block_table: list[int] = field(default_factory=list)
     status: SequenceStatus = SequenceStatus.WAITING
     num_cached_tokens: int = 0
+    sampling: SamplingParams = field(default_factory=SamplingParams)
+    finish_reason: str | None = None  # "length" or "stop" once finished
 
     def __post_init__(self) -> None:
         if not self.prompt_token_ids:

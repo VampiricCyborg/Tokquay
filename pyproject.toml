@@ -22,9 +22,11 @@ dev = [
     "hypothesis>=6.168.1",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "pytest-timeout>=2.4.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
+timeout = 600  # a hung scheduler must fail the test, not the whole run

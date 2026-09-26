@@ -7,8 +7,9 @@
   3. one paged forward over the batch (prefill *or* decode, see scheduler.py);
   4. sample one token per sequence, append it, and check stop conditions.
 
-It is synchronous and single-threaded; the server (Phase 5) drives it from a
-background task and turns the returned ``TokenEvent``s into streamed responses.
+It is synchronous and not thread-safe; the server (Phase 5, ``async_engine.py``)
+drives it from one dedicated thread and turns the returned ``TokenEvent``s into
+streamed responses.
 """
 
 from __future__ import annotations
@@ -90,6 +91,13 @@ class Engine:
             gen.manual_seed(seq.sampling.seed if seq.sampling.seed is not None else torch.seed() % 2**63)
             self._rngs[seq.seq_id] = gen
         return seq
+
+    def abort_request(self, seq: Sequence) -> None:
+        """Cancel a request (e.g. its client disconnected) and free its KV blocks.
+
+        Call between steps, never while ``step()`` is running."""
+        self.scheduler.abort(seq)
+        self._rngs.pop(seq.seq_id, None)
 
     def has_unfinished(self) -> bool:
         return self.scheduler.has_unfinished()

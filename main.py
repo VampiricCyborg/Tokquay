@@ -1,6 +1,4 @@
-def main():
-    print("Hello from tokquay!")
-
+from tokquay.server import main
 
 if __name__ == "__main__":
     main()

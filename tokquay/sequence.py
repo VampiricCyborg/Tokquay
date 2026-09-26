@@ -53,7 +53,7 @@ class Sequence:
     status: SequenceStatus = SequenceStatus.WAITING
     num_cached_tokens: int = 0
     sampling: SamplingParams = field(default_factory=SamplingParams)
-    finish_reason: str | None = None  # "length" or "stop" once finished
+    finish_reason: str | None = None  # "length", "stop" or "abort" once finished
 
     def __post_init__(self) -> None:
         if not self.prompt_token_ids:

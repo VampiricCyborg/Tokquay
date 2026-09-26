@@ -83,6 +83,84 @@ recomputing the same prompt over and over. The reserve does not apply to a
 request that would run alone, so a request needing the whole pool is not
 blocked by it.
 
+## Phase 5: server and streaming
+
+### The engine runs on its own thread, and only that thread touches it
+
+`Engine.step()` is a blocking forward pass (tens of milliseconds, far more with a
+big batch or a long prefill). Run as an asyncio task it would freeze every open
+SSE stream and every new connection for the length of the step. So the loop runs
+on one dedicated thread (PyTorch releases the GIL inside its ops, so the event
+loop stays responsive while a step runs).
+
+The alternatives were `run_in_executor(engine.step)` from an asyncio task, or a
+lock around the engine. Both leave the scheduler's queues reachable from two
+threads. Instead the engine thread is the *only* one that ever touches the engine,
+scheduler or allocator. The event loop sends it commands through an inbox queue
+("add this request", "abort that one") and gets tokens back through one
+`asyncio.Queue` per request, filled with a single `call_soon_threadsafe` per step
+(not per token). No locks, and the invariants the scheduler tests check hold
+because there is exactly one writer.
+
+Rejection checks (`rejection_reason`) depend only on constants (pool size, limits),
+so the event loop runs them directly and answers 400 immediately instead of
+round-tripping through the engine thread.
+
+### Cancellation: a request nobody is waiting for must stop
+
+If a client disconnects and the engine keeps decoding, the GPU works for nobody
+and the request's KV blocks stay allocated, which under load starves real
+requests. `Scheduler.abort` / `Engine.abort_request` remove a sequence from
+wherever it is (waiting, preempted and waiting, or running) and return its blocks.
+
+The streaming endpoint aborts in a `finally` around the token loop, which runs
+whether the stream ends, the client leaves, or the task is cancelled. A plain JSON
+request is not cancelled by the server when the client leaves, so that path checks
+`request.is_disconnected()` once per token. Tests disable the abort and confirm both
+disconnect tests fail, and check that after a disconnect the pool is whole again.
+
+### A dead engine fails requests instead of hanging them
+
+If `step()` raises, the engine state is inconsistent and there is no safe way to
+continue. The thread records the failure, delivers `EngineError` to every in-flight
+request and every command still in the inbox, and marks itself closed. Streams end
+with an `event: error`, plain requests get 503, new requests get 503, and `/health`
+returns 503. The alternative, a thread that dies quietly, leaves every client
+waiting forever.
+
+### Wire format
+
+* `stream: false`: one JSON object (`text`, `token_ids`, `finish_reason`, token
+  counts). `stream: true`: SSE, one `data:` event per token, the last one carries
+  `finish_reason`. FastAPI's `EventSourceResponse` only supports endpoints that are
+  generators, and the brief wants one endpoint with a `stream` flag, so the
+  `StreamingResponse` is built by hand.
+* Every token is an event, even when it produces no text (part of a multi-byte
+  character), so clients and the Phase 6 benchmark can count tokens and timestamp
+  each one.
+* The EOS token is generated and counted (`token_ids` includes it, `finish_reason`
+  is `stop`) but produces no text.
+* Optional `seed` (reproducible sampling) and `ignore_eos` (fixed-length runs, which
+  the benchmark needs) go beyond the brief's field list.
+
+### Detokenizing a stream
+
+GPT-2's byte-level BPE can spread one character over several tokens (a rocket emoji
+is three). Decoding each token alone would emit U+FFFD for the incomplete pieces.
+`IncrementalDetokenizer` decodes a small window before and after each new token and
+emits only the added text, holding back while the window ends in U+FFFD; `flush`
+emits the remainder at the end of the stream. Byte-level decoding is context-free,
+so the concatenated deltas equal decoding everything at once (a test asserts it).
+
+### Known limits
+
+* A request that sits in the waiting queue produces no bytes until it is admitted,
+  so a proxy with a short idle timeout could cut it. No keep-alive comments are sent.
+* One process, one engine: uvicorn workers would each load the model and own a pool.
+* A quick check with 20 concurrent requests (same workload, engine alone vs. through
+  HTTP) found the server adding about 5% to the run time. That is one measurement
+  on one machine, not a benchmark; Phase 6 should measure it properly.
+
 ## Chunked prefill (not implemented)
 
 A long prompt is prefilled in one step, and the whole running batch waits for

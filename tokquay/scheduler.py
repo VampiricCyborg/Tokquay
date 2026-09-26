@@ -112,6 +112,21 @@ class Scheduler:
         seq.status = SequenceStatus.FINISHED
         seq.finish_reason = reason
 
+    def abort(self, seq: Sequence) -> None:
+        """Drop a request nobody is waiting for any more (its client went away).
+
+        Works wherever the sequence is: queued, preempted and queued, or running.
+        Its blocks go back to the pool. A no-op if it already finished."""
+        if seq.status is SequenceStatus.FINISHED:
+            return
+        if seq in self.running:
+            self.running.remove(seq)
+        else:
+            self.waiting.remove(seq)
+        self.allocator.free(seq)  # a queued sequence owns no blocks, so this is then a no-op
+        seq.status = SequenceStatus.FINISHED
+        seq.finish_reason = "abort"
+
     # ---- one scheduling decision ---------------------------------------------------
     def schedule(self) -> ScheduledBatch | None:
         """Pick the sequences for the next step (or None if there is nothing to do)."""

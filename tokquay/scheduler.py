@@ -77,6 +77,7 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []  # in admission order: the last one is the newest
         self.num_preemptions = 0
+        self.num_discarded_positions = 0  # K/V positions thrown away by preemption (work to redo)
 
     # ---- requests ------------------------------------------------------------------
     def max_context(self, seq: Sequence) -> int:
@@ -182,6 +183,7 @@ class Scheduler:
         return ScheduledBatch(list(running), is_prefill=False, preempted=preempted)
 
     def _preempt(self, seq: Sequence) -> None:
+        self.num_discarded_positions += seq.num_cached_tokens  # all of it must be recomputed
         self.allocator.free(seq)
         seq.reset_for_recompute()  # keeps output_token_ids; status -> WAITING
         self.waiting.appendleft(seq)  # front: keeps arrival order among waiting requests

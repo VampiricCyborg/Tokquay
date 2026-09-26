@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tokquay.kv_cache import PagedBatch
+from tokquay.kv_cache import BatchedKV
 
 
 @dataclass
@@ -53,7 +53,7 @@ class ContiguousKVCache:
         return (self.k.numel() + self.v.numel()) * self.k.element_size()
 
 
-KVCache = ContiguousKVCache | PagedBatch
+KVCache = ContiguousKVCache | BatchedKV  # BatchedKV: PagedBatch, or the baseline's ContiguousBatch
 
 
 class Attention(nn.Module):
@@ -70,7 +70,7 @@ class Attention(nn.Module):
         # [B, T, C] -> [B, n_head, T, d_head]
         q, k, v = (t.view(B, T, self.n_head, self.d_head).transpose(1, 2) for t in (q, k, v))
 
-        if isinstance(cache, PagedBatch):
+        if isinstance(cache, BatchedKV):
             # Phase 3: scatter new K/V into the block pool, then gather every sequence's
             # blocks back (via its block table) and attend over them in one batched op.
             cache.write(layer, k, v)
@@ -146,12 +146,13 @@ class GPT2(nn.Module):
         a single token per sequence for decode.
 
         * ``ContiguousKVCache`` (Phase 2): one shared length; advances by T.
-        * ``PagedBatch`` (Phase 3): per-sequence start positions and lengths, with
-          ``input_ids`` right-padded to T. The caller owns ``num_cached_tokens``.
-          ``last_only`` returns the logits of each sequence's last *real* token.
+        * ``BatchedKV`` (Phase 3 ``PagedBatch``, Phase 6 baseline ``ContiguousBatch``):
+          per-sequence start positions and lengths, with ``input_ids`` right-padded
+          to T. The caller owns ``num_cached_tokens``. ``last_only`` returns the
+          logits of each sequence's last *real* token.
         """
         B, T = input_ids.shape
-        paged = isinstance(cache, PagedBatch)
+        paged = isinstance(cache, BatchedKV)
         if paged:
             if (B, T) != (cache.B, cache.T):
                 raise ValueError(f"input_ids {tuple(input_ids.shape)} does not match batch {(cache.B, cache.T)}")

@@ -45,6 +45,39 @@ class EngineStats:
     max_batch: int = 0  # most sequences in one step
     peak_used_blocks: int = 0  # high-water mark of KV blocks in use
     num_preemptions: int = 0
+    # Work accounting, in token positions run through the model:
+    positions_computed: int = 0  # real positions fed (prompt + recomputed + decoded)
+    positions_padded: int = 0  # what the model actually computed: batch x longest row
+    positions_discarded: int = 0  # cached positions thrown away by preemption (all recomputed)
+
+
+@dataclass
+class KVSnapshot:
+    """KV memory right now, in token slots (multiply by bytes per token for bytes)."""
+
+    allocated_tokens: int  # slots held by running sequences (blocks x block size; or rows x max_len)
+    live_tokens: int  # slots that actually hold a cached token
+    num_seqs: int  # sequences holding KV memory
+
+
+@dataclass
+class StepInfo:
+    """What the last ``step()`` ran. Shared by ``Engine`` and the baseline so the
+    benchmark can drive either one."""
+
+    is_prefill: bool
+    num_seqs: int  # sequences in the step
+    padded_tokens: int  # batch size x longest row
+    kv: KVSnapshot  # KV memory at the step's peak: after the forward, before finished sequences are freed
+
+
+def finish_reason_for(seq: Sequence, token: int, eos_token_id: int) -> str | None:
+    """Why ``seq`` is done after sampling ``token`` (None if it is not)."""
+    if not seq.sampling.ignore_eos and token == eos_token_id:
+        return "stop"
+    if len(seq.output_token_ids) >= seq.sampling.max_tokens:
+        return "length"
+    return None
 
 
 def sample_token(logits: torch.Tensor, params: SamplingParams, generator: torch.Generator | None) -> int:
@@ -76,6 +109,7 @@ class Engine:
         self.scheduler = Scheduler(allocator, config)
         self.eos_token_id = eos_token_id
         self.stats = EngineStats()
+        self.last_step: StepInfo | None = None  # None if the last step() had nothing to run
         self._next_id = 0
         self._rngs: dict[int, torch.Generator] = {}
 
@@ -102,12 +136,21 @@ class Engine:
     def has_unfinished(self) -> bool:
         return self.scheduler.has_unfinished()
 
+    def kv_snapshot(self) -> KVSnapshot:
+        running = self.scheduler.running
+        return KVSnapshot(
+            allocated_tokens=self.allocator.num_used_blocks * self.allocator.block_size,
+            live_tokens=sum(s.num_cached_tokens for s in running),
+            num_seqs=len(running),
+        )
+
     # ---- the loop ------------------------------------------------------------------
     @torch.no_grad()
     def step(self) -> list[TokenEvent]:
         """Run one iteration; returns the tokens produced (empty if idle)."""
         batch = self.scheduler.schedule()
         if batch is None:
+            self.last_step = None
             return []
 
         stats = self.stats
@@ -117,8 +160,12 @@ class Engine:
         stats.max_batch = max(stats.max_batch, len(batch.seqs))
         stats.peak_used_blocks = max(stats.peak_used_blocks, self.allocator.num_used_blocks)
         stats.num_preemptions = self.scheduler.num_preemptions
+        stats.positions_discarded = self.scheduler.num_discarded_positions
+        stats.positions_computed += sum(s.num_uncached_tokens for s in batch.seqs)  # before the forward advances the cache
+        stats.positions_padded += batch.padded_tokens
 
         logits = paged_forward(self.model, self.allocator, batch.seqs)  # [B, vocab]
+        self.last_step = StepInfo(batch.is_prefill, len(batch.seqs), batch.padded_tokens, self.kv_snapshot())
         tokens = self._sample(batch.seqs, logits)
 
         events = []
@@ -147,8 +194,4 @@ class Engine:
         return tokens.tolist()  # the step's single GPU sync
 
     def _finish_reason(self, seq: Sequence, token: int) -> str | None:
-        if not seq.sampling.ignore_eos and token == self.eos_token_id:
-            return "stop"
-        if len(seq.output_token_ids) >= seq.sampling.max_tokens:
-            return "length"
-        return None
+        return finish_reason_for(seq, token, self.eos_token_id)

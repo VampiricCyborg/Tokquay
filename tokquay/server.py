@@ -172,7 +172,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--block-size", type=int, default=16, help="tokens per KV block")
     ap.add_argument("--max-num-seqs", type=int, default=64)
     ap.add_argument("--max-num-batched-tokens", type=int, default=2048)
+    ap.add_argument("--gpu-memory-fraction", type=float, default=None,
+                    help="cap PyTorch's CUDA allocator at this fraction of VRAM. On a small Windows GPU (4 GiB) pass 0.8: "
+                         "uncapped, the allocator can grow to the whole card and decode steps slow down 10x")  # fmt: skip
     args = ap.parse_args(argv)
+    if args.gpu_memory_fraction and torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction)
 
     config = SchedulerConfig(max_num_seqs=args.max_num_seqs, max_num_batched_tokens=args.max_num_batched_tokens)
     engine, tokenizer = build_engine(args.num_blocks, args.block_size, args.device, config)

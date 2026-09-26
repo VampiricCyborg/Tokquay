@@ -117,17 +117,20 @@ Each phase must pass its tests before the next one starts.
 
 ## Results
 
-_Filled in after Phase 6. Only real numbers from `bench/bench.py`._
+Only real numbers from `bench/bench.py` (RTX 3050 Laptop 4 GiB, fp32, 300 requests, Poisson arrivals at 4 requests/s,
+prompt and output lengths uniform in [16, 256], both systems given the same 1.125 GiB of KV memory). The other arrival
+rates, the plots and the caveats are in the README and `Documentation/results.md`.
 
 | Metric | Static baseline | Tokquay |
 |---|---|---|
-| Throughput (tok/s) | | |
-| TTFT p50 / p99 | | |
-| ITL p50 / p99 | | |
-| Peak KV memory | | |
-| Max concurrent seqs | | |
+| Throughput (tok/s) | 544.8 | 570.9 |
+| TTFT p50 / p99 (ms) | 2,901 / 6,400 | 38 / 74 |
+| ITL p50 / p99 (ms) | 21.8 / 42.0 | 26.6 / 74.7 |
+| Peak KV memory in use (MiB) | 1152 | 568 |
+| Max concurrent seqs | 32 | 32 |
 
 ## Design decisions to write up
+Written up with their measurements in `design-notes.md`.
 - Block size (16 vs 32): internal fragmentation vs. gather overhead. Measure both.
 - Recompute vs. swap for preemption, and why recompute is fine at this scale.
 - Chunked prefill: not implemented. Explain what problem it solves (long prompts stalling decode).

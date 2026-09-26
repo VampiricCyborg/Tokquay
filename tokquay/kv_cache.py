@@ -127,7 +127,37 @@ class BlockAllocator:
         return PagedBatch(self.pool, self.block_size, [s.block_table for s in seqs], starts, new_lens)
 
 
-class PagedBatch:
+class BatchedKV:
+    """What ``GPT2.forward`` needs from a per-step batch view of the KV cache.
+
+    ``PagedBatch`` (below) keeps K/V in a block pool addressed through block tables;
+    ``baseline.ContiguousBatch`` keeps each row's K/V in its own pre-reserved slab.
+    The model does not care which: it only uses these members.
+
+    * ``B``, ``T``: batch size and (padded) number of new tokens per row.
+    * ``max_ctx``: longest row after this step, as a Python int.
+    * ``positions`` ``[B, T]``: absolute position of every new token.
+    * ``last_idx`` ``[B]``: column of each row's last real token.
+    * ``mask`` ``[B, 1, T, S]``: True where a query may attend to a key slot.
+    * ``write(layer, k, v)``: store new K/V ``[B, H, T, d]``; padded slots must not write.
+    * ``gather(layer)``: every row's K and V as ``[B, H, S, d]`` (``S`` matches ``mask``).
+    """
+
+    B: int
+    T: int
+    max_ctx: int
+    positions: torch.Tensor
+    last_idx: torch.Tensor
+    mask: torch.Tensor
+
+    def write(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        raise NotImplementedError
+
+    def gather(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError
+
+
+class PagedBatch(BatchedKV):
     """Everything the model needs to run one batched step over paged KV.
 
     Sequence ``b`` feeds ``new_lens[b]`` new tokens at absolute positions

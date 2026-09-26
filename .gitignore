@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.hypothesis/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Model weights / downloaded artifacts
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Benchmark outputs (regenerate with bench/bench.py)
+bench/results/
+bench/*.csv
+bench/*.json
+bench/*.png
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# AI tooling (keep out of the repo)
+.claude/
+CLAUDE.md
+/C*UsersMadhav*claude-notify-signals*

@@ -18,6 +18,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tokquay.kv_cache import PagedBatch
+
 
 @dataclass
 class GPT2Config:
@@ -51,6 +53,9 @@ class ContiguousKVCache:
         return (self.k.numel() + self.v.numel()) * self.k.element_size()
 
 
+KVCache = ContiguousKVCache | PagedBatch
+
+
 class Attention(nn.Module):
     def __init__(self, cfg: GPT2Config):
         super().__init__()
@@ -59,28 +64,35 @@ class Attention(nn.Module):
         self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd)
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd)
 
-    def forward(self, x: torch.Tensor, cache: ContiguousKVCache | None = None, layer: int = 0) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: KVCache | None = None, layer: int = 0) -> torch.Tensor:
         B, T, C = x.shape
         q, k, v = self.c_attn(x).split(C, dim=-1)
         # [B, T, C] -> [B, n_head, T, d_head]
         q, k, v = (t.view(B, T, self.n_head, self.d_head).transpose(1, 2) for t in (q, k, v))
 
-        start = 0
-        if cache is not None:
-            # Write the new K/V into the cache, then attend over everything cached so far.
-            start = cache.length
-            cache.k[layer, :, :, start : start + T] = k
-            cache.v[layer, :, :, start : start + T] = v
-            k = cache.k[layer, :, :, : start + T]
-            v = cache.v[layer, :, :, : start + T]
-        S = start + T  # number of keys
+        if isinstance(cache, PagedBatch):
+            # Phase 3: scatter new K/V into the block pool, then gather every sequence's
+            # blocks back (via its block table) and attend over them in one batched op.
+            cache.write(layer, k, v)
+            k, v = cache.gather(layer)  # [B, H, nb*block_size, d]
+            allowed = cache.mask  # [B, 1, T, nb*block_size]: causal + drops block padding
+        else:
+            start = 0
+            if cache is not None:
+                # Write the new K/V into the cache, then attend over everything cached so far.
+                start = cache.length
+                cache.k[layer, :, :, start : start + T] = k
+                cache.v[layer, :, :, start : start + T] = v
+                k = cache.k[layer, :, :, : start + T]
+                v = cache.v[layer, :, :, : start + T]
+            # Query i sits at absolute position start+i and may see keys j <= start+i.
+            # Prefill (start=0) gives the usual lower-triangular mask; decode (T=1) sees all.
+            q_pos = torch.arange(start, start + T, device=x.device)[:, None]
+            k_pos = torch.arange(start + T, device=x.device)[None, :]
+            allowed = k_pos <= q_pos
 
         scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)  # [B, H, T, S]
-        # Query i sits at absolute position start+i and may see keys j <= start+i.
-        # Prefill (start=0) gives the usual lower-triangular mask; decode (T=1) sees all.
-        q_pos = torch.arange(start, start + T, device=x.device)[:, None]
-        k_pos = torch.arange(S, device=x.device)[None, :]
-        scores = scores.masked_fill(k_pos > q_pos, float("-inf"))
+        scores = scores.masked_fill(~allowed, float("-inf"))
         out = F.softmax(scores, dim=-1) @ v  # [B, H, T, d_head]
 
         out = out.transpose(1, 2).reshape(B, T, C)
@@ -106,7 +118,7 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(cfg.n_embd, eps=cfg.layer_norm_eps)
         self.mlp = MLP(cfg)
 
-    def forward(self, x: torch.Tensor, cache: ContiguousKVCache | None = None, layer: int = 0) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: KVCache | None = None, layer: int = 0) -> torch.Tensor:
         x = x + self.attn(self.ln_1(x), cache, layer)
         x = x + self.mlp(self.ln_2(x))
         return x
@@ -124,30 +136,46 @@ class GPT2(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        cache: ContiguousKVCache | None = None,
+        cache: KVCache | None = None,
         last_only: bool = False,
     ) -> torch.Tensor:
         """input_ids: [B, T] -> logits [B, T, vocab] (or [B, 1, vocab] if ``last_only``).
 
         Without a cache this is the Phase 1 full-sequence forward. With a cache,
         ``input_ids`` are the *new* tokens only: the whole prompt for prefill, or
-        a single token per sequence for decode. The cache length advances by T.
+        a single token per sequence for decode.
+
+        * ``ContiguousKVCache`` (Phase 2): one shared length; advances by T.
+        * ``PagedBatch`` (Phase 3): per-sequence start positions and lengths, with
+          ``input_ids`` right-padded to T. The caller owns ``num_cached_tokens``.
+          ``last_only`` returns the logits of each sequence's last *real* token.
         """
         B, T = input_ids.shape
-        start = cache.length if cache is not None else 0
-        if start + T > self.cfg.n_positions:
-            raise ValueError(f"sequence length {start + T} exceeds n_positions={self.cfg.n_positions}")
-        if cache is not None and start + T > cache.max_len:
-            raise ValueError(f"sequence length {start + T} exceeds cache max_len={cache.max_len}")
+        paged = isinstance(cache, PagedBatch)
+        if paged:
+            if (B, T) != (cache.B, cache.T):
+                raise ValueError(f"input_ids {tuple(input_ids.shape)} does not match batch {(cache.B, cache.T)}")
+            if cache.max_ctx > self.cfg.n_positions:
+                raise ValueError(f"sequence length {cache.max_ctx} exceeds n_positions={self.cfg.n_positions}")
+            # Real tokens are always in range; only padded slots can overshoot, so clamp them
+            # to keep the embedding lookup valid (their outputs are discarded).
+            pos = cache.positions.clamp(max=self.cfg.n_positions - 1)  # [B, T]
+        else:
+            start = cache.length if cache is not None else 0
+            if start + T > self.cfg.n_positions:
+                raise ValueError(f"sequence length {start + T} exceeds n_positions={self.cfg.n_positions}")
+            if cache is not None and start + T > cache.max_len:
+                raise ValueError(f"sequence length {start + T} exceeds cache max_len={cache.max_len}")
+            pos = torch.arange(start, start + T, device=input_ids.device)
 
-        pos = torch.arange(start, start + T, device=input_ids.device)
         x = self.wte(input_ids) + self.wpe(pos)
         for i, block in enumerate(self.h):
             x = block(x, cache, i)
-        if cache is not None:
+        if isinstance(cache, ContiguousKVCache):
             cache.length += T
         if last_only:
-            x = x[:, -1:]  # skip the [T, vocab] projection for positions we never sample from
+            # Skip the [T, vocab] projection for positions we never sample from.
+            x = x[torch.arange(B, device=x.device), cache.last_idx][:, None] if paged else x[:, -1:]
         x = self.ln_f(x)
         return x @ self.wte.weight.T  # tied LM head
 

@@ -1,7 +1,6 @@
 """Phase 2: contiguous KV cache gives identical results, and decode stops scaling with length."""
 
 import copy
-import statistics
 
 import pytest
 import torch
@@ -84,9 +83,9 @@ def test_decode_time_vs_length_logged(model, capsys):
         greedy_generate(model, ids, 3, use_cache=True)  # warm-up
         greedy_generate(model, ids, 12, use_cache=True, step_times=cached)
         greedy_generate(model, ids, 12, use_cache=False, step_times=uncached)
-        rows.append((prompt_len, statistics.median(cached) * 1e3, statistics.median(uncached) * 1e3))
+        rows.append((prompt_len, min(cached) * 1e3, min(uncached) * 1e3))  # min: robust to load spikes
     with capsys.disabled():
-        print(f"\n[{DEVICE}] median ms per decoded token")
+        print(f"\n[{DEVICE}] best-case ms per decoded token")
         print("  ctx   cached   no-cache   speedup")
         for n, c, u in rows:
             print(f"  {n:4d}  {c:7.2f}  {u:9.2f}  {u / c:6.1f}x")
